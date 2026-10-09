@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const https = require("https");
 
 const distDir = path.join(process.cwd(), "dist_deploy");
 if (fs.existsSync(distDir)) {
@@ -10,106 +11,147 @@ fs.writeFileSync(path.join(distDir, ".nojekyll"), "");
 
 const repoName = process.env.GITHUB_REPOSITORY
   ? process.env.GITHUB_REPOSITORY.split("/")[1]
-  : "5k-links-10-8-2026-v3";
+  : "5k-links-10-8-2026-v2";
 const repoPrefix = `/${repoName}/`;
 
-// 1. Copy folders specific to this repo
-const assetDirs = [
-  "files",
-  "images",
-  "resources"
-];
-
-for (const dir of assetDirs) {
-  if (fs.existsSync(dir)) {
-    fs.cpSync(dir, path.join(distDir, dir), { recursive: true });
-  }
+// Helper function to download remote files via HTTPS
+function downloadFile(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return downloadFile(res.headers.location).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`Failed to fetch ${url}, status: ${res.statusCode}`));
+      }
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => resolve(data));
+    }).on("error", reject);
+  });
 }
 
-// 2. Copy root files like learningresources.json, sw.js, etc.
-for (const item of fs.readdirSync(process.cwd())) {
-  const full = path.join(process.cwd(), item);
-  if (fs.statSync(full).isFile() && !item.startsWith(".") && item !== "build.js") {
-    fs.copyFileSync(full, path.join(distDir, item));
+async function runBuild() {
+  // 1. Download the specific remote logo.svg
+  const svgUrl = "https://cdn.staticdelivr.com/gh/task4z/classroom-15x/ebc85c55d9e12d923cafa5961c305b59794868d3/files/catclass/logo.svg";
+  console.log(`Downloading target SVG from: ${svgUrl}`);
+  let targetSvgContent;
+  try {
+    targetSvgContent = await downloadFile(svgUrl);
+  } catch (err) {
+    console.error("Error downloading logo.svg:", err.message);
+    process.exit(1);
   }
-}
 
-// 3. Patch JSON and JS files to resolve from repository subpath
-function patchFile(filePath) {
-  let content = fs.readFileSync(filePath, "utf8");
-  const updated = content
-    .replace(/(['"])\/files\//g, `$1${repoPrefix}files/`)
-    .replace(/(['"])\/images\//g, `$1${repoPrefix}images/`)
-    .replace(/(['"])\/resources\//g, `$1${repoPrefix}resources/`)
-    .replace(/(['"])\/learningresources\.json/g, `$1${repoPrefix}learningresources.json`);
+  // 2. Git LFS rules for deployment
+  const gitattributesContent = [
+    "books/html/fnafi/* filter=lfs diff=lfs merge=lfs -text",
+    "books/html/fnafi3/* filter=lfs diff=lfs merge=lfs -text",
+    "*.zip filter=lfs diff=lfs merge=lfs -text",
+    "*.wasm filter=lfs diff=lfs merge=lfs -text",
+    ""
+  ].join("\n");
+  fs.writeFileSync(path.join(distDir, ".gitattributes"), gitattributesContent);
 
-  if (updated !== content) {
-    fs.writeFileSync(filePath, updated, "utf8");
-  }
-}
+  // 3. Copy asset folders
+  const assetDirs = [
+    "__rv",
+    "books",
+    "data",
+    "dist",
+    "help",
+    "icons",
+    "linux",
+    "os",
+    "reviews",
+    "status",
+    "wallpapers"
+  ];
 
-function walkAndPatch(dir) {
-  for (const item of fs.readdirSync(dir)) {
-    if (item === ".git") continue;
-    const full = path.join(dir, item);
-    if (fs.statSync(full).isDirectory()) {
-      walkAndPatch(full);
-    } else if (/\.(js|json|css|webmanifest|html)$/i.test(item)) {
-      patchFile(full);
+  for (const dir of assetDirs) {
+    if (fs.existsSync(dir)) {
+      fs.cpSync(dir, path.join(distDir, dir), { recursive: true });
     }
   }
-}
-walkAndPatch(distDir);
 
-// 4. Base HTML setup with repository prefix
-if (!fs.existsSync("index.html")) {
-  console.error("Error: index.html not found!");
-  process.exit(1);
-}
-let appHtml = fs.readFileSync("index.html", "utf8");
+  // 4. Copy root files and mirror script assets to dist/
+  for (const item of fs.readdirSync(process.cwd())) {
+    const full = path.join(process.cwd(), item);
+    if (fs.statSync(full).isFile() && !item.startsWith(".") && item !== "build.js") {
+      fs.copyFileSync(full, path.join(distDir, item));
+    }
+  }
 
-// Convert root paths like href="/resources/..."
-appHtml = appHtml.replace(/(href|src)=["']\/(?!\/)(.*?)["']/gi, `$1="${repoPrefix}$2"`);
+  fs.mkdirSync(path.join(distDir, "dist"), { recursive: true });
+  for (const item of fs.readdirSync(distDir)) {
+    if (item.endsWith(".js") || item.endsWith(".css")) {
+      fs.copyFileSync(path.join(distDir, item), path.join(distDir, "dist", item));
+    }
+  }
 
-if (!appHtml.includes("<base ")) {
-  appHtml = appHtml.replace(/<head([^>]*)>/i, `<head$1>\n    <base href="${repoPrefix}">`);
-}
+  // Save the downloaded SVG as index.svg at the root
+  fs.writeFileSync(path.join(distDir, "index.svg"), targetSvgContent);
 
-// 5. Generate 5,000 physical nested directories
-const TOTAL_PAGES = 5000;
-const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  // 5. Build an HTML wrapper that renders the SVG full-screen while linking root assets
+  const htmlWrapper = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <base href="${repoPrefix}">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>App</title>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+    object { width: 100%; height: 100%; border: none; display: block; }
+  </style>
+  <script src="build-info.js"></script>
+  <script src="achroma.js"></script>
+</head>
+<body>
+  <object data="${repoPrefix}index.svg" type="image/svg+xml"></object>
+</body>
+</html>`;
 
-function getRandomSegment(minLen = 4, maxLen = 10) {
-  const len = Math.floor(Math.random() * (maxLen - minLen + 1)) + minLen;
-  let seg = "";
-  for (let i = 0; i < len; i++) seg += chars.charAt(Math.floor(Math.random() * chars.length));
-  return seg;
-}
+  // 6. Generate 5,000 unique paths
+  const TOTAL_PAGES = 5000;
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
 
-function getNestedPath(minSegments = 2, maxSegments = 4) {
-  const depth = Math.floor(Math.random() * (maxSegments - minSegments + 1)) + minSegments;
-  const segs = [];
-  for (let i = 0; i < depth; i++) segs.push(getRandomSegment(4, 10));
-  return segs.join("/");
-}
+  function getRandomSegment(minLen = 4, maxLen = 10) {
+    const len = Math.floor(Math.random() * (maxLen - minLen + 1)) + minLen;
+    let seg = "";
+    for (let i = 0; i < len; i++) seg += chars.charAt(Math.floor(Math.random() * chars.length));
+    return seg;
+  }
 
-const uniquePaths = new Set();
-while (uniquePaths.size < TOTAL_PAGES) {
-  uniquePaths.add(getNestedPath(2, 4));
-}
+  function getNestedPath(minSegments = 2, maxSegments = 4) {
+    const depth = Math.floor(Math.random() * (maxSegments - minSegments + 1)) + minSegments;
+    const segs = [];
+    for (let i = 0; i < depth; i++) segs.push(getRandomSegment(4, 10));
+    return segs.join("/");
+  }
 
-let masterLinksHtml = "";
+  const uniquePaths = new Set();
+  while (uniquePaths.size < TOTAL_PAGES) {
+    uniquePaths.add(getNestedPath(2, 4));
+  }
 
-for (const nestedPath of uniquePaths) {
-  const folderPath = path.join(distDir, nestedPath);
-  fs.mkdirSync(folderPath, { recursive: true });
+  let masterLinksHtml = "";
 
-  fs.writeFileSync(path.join(folderPath, "index.html"), appHtml);
-  masterLinksHtml += `<a class="card" href="./${nestedPath}/">${nestedPath}</a>\n`;
-}
+  for (const nestedPath of uniquePaths) {
+    const folderPath = path.join(distDir, nestedPath);
+    fs.mkdirSync(folderPath, { recursive: true });
 
-// 6. Directory Index Dashboard
-const indexHtml = `<!DOCTYPE html>
+    // Provide the HTML wrapper so browser engines handle script scopes properly
+    fs.writeFileSync(path.join(folderPath, "index.html"), htmlWrapper);
+
+    // Provide index.svg in each directory for direct SVG resolution
+    fs.writeFileSync(path.join(folderPath, "index.svg"), targetSvgContent);
+
+    masterLinksHtml += `<a class="card" href="./${nestedPath}/">${nestedPath}</a>\n`;
+  }
+
+  // 7. Directory index dashboard
+  const indexHtml = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -158,5 +200,8 @@ const indexHtml = `<!DOCTYPE html>
 </body>
 </html>`;
 
-fs.writeFileSync(path.join(distDir, "index.html"), indexHtml);
-console.log("Successfully generated all 5,000 directories and site index.");
+  fs.writeFileSync(path.join(distDir, "index.html"), indexHtml);
+  console.log("Build successfully completed with custom remote logo.svg!");
+}
+
+runBuild();
